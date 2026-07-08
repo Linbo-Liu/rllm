@@ -4,6 +4,7 @@ import argparse
 import asyncio
 import logging
 import os
+import time
 import uuid
 from collections.abc import Awaitable, Callable
 from contextlib import asynccontextmanager
@@ -87,6 +88,19 @@ def create_store(config: GatewayConfig) -> TraceStore:
         from rllm_model_gateway.store.memory_store import MemoryTraceStore
 
         return MemoryTraceStore()
+    elif worker == "s3":
+        from rllm_model_gateway.store.s3_store import S3TraceStore
+
+        bucket = config.s3_bucket or os.environ.get("RLLM_GATEWAY_S3_BUCKET")
+        if not bucket:
+            raise ValueError(
+                "store_worker='s3' requires config.s3_bucket or RLLM_GATEWAY_S3_BUCKET"
+            )
+        return S3TraceStore(
+            bucket=bucket,
+            prefix=config.s3_prefix or os.environ.get("RLLM_GATEWAY_S3_PREFIX", ""),
+            region_name=config.s3_region or os.environ.get("AWS_REGION"),
+        )
     else:
         raise ValueError(f"Unknown store worker: {worker}")
 
@@ -281,7 +295,19 @@ def create_app(
         since: float | None = Query(None),
         limit: int | None = Query(None),
     ):
-        traces = await store.get_session_traces(session_id, since=since, limit=limit)
+        records = await store.get_session_traces(session_id, since=since, limit=limit)
+        reward = next(
+            (r for r in records if r.get("kind") == "reward"),
+            None,
+        )
+        traces = [r for r in records if r.get("kind") != "reward"]
+        if reward is not None:
+            for t in traces:
+                meta = t.setdefault("metadata", {}) or {}
+                meta["reward"] = reward.get("value")
+                if reward.get("metadata"):
+                    meta["reward_metadata"] = reward["metadata"]
+                t["metadata"] = meta
         return traces
 
     @app.get("/sessions/{session_id:path}")
@@ -299,6 +325,23 @@ def create_app(
         proxy._accumulators.pop(session_id, None)
         count = await sessions.delete_session(session_id)
         return {"deleted": count}
+
+    @app.post("/sessions/{session_id}/reward")
+    async def post_reward(session_id: str, request: Request):
+        body = await _safe_json(request)
+        reward_id = f"reward-{session_id}"
+        payload = {
+            "trace_id": reward_id,
+            "session_id": session_id,
+            "kind": "reward",
+            "value": body.get("value"),
+            "trace_ref": body.get("trace_id"),
+            "metadata": body.get("metadata", {}),
+            "timestamp": time.time(),
+        }
+        sessions.ensure_session(session_id)
+        await store.store_trace(reward_id, session_id, payload)
+        return {"reward_id": reward_id}
 
     @app.post("/sessions/batch_delete")
     async def batch_delete_sessions(request: Request):
@@ -477,6 +520,9 @@ def _load_config(args: argparse.Namespace) -> GatewayConfig:
         "RLLM_GATEWAY_DB_PATH": "db_path",
         "RLLM_GATEWAY_LOG_LEVEL": "log_level",
         "RLLM_GATEWAY_STORE": "store_worker",
+        "RLLM_GATEWAY_S3_BUCKET": "s3_bucket",
+        "RLLM_GATEWAY_S3_PREFIX": "s3_prefix",
+        "RLLM_GATEWAY_S3_REGION": "s3_region",
     }
     for env_key, config_key in env_map.items():
         val = os.environ.get(env_key)
@@ -497,6 +543,12 @@ def _load_config(args: argparse.Namespace) -> GatewayConfig:
         data["log_level"] = args.log_level
     if getattr(args, "store", None) is not None:
         data["store_worker"] = args.store
+    if getattr(args, "s3_bucket", None) is not None:
+        data["s3_bucket"] = args.s3_bucket
+    if getattr(args, "s3_prefix", None) is not None:
+        data["s3_prefix"] = args.s3_prefix
+    if getattr(args, "s3_region", None) is not None:
+        data["s3_region"] = args.s3_region
     if getattr(args, "model", None) is not None:
         data["model"] = args.model
     if getattr(args, "cumulative_token_mode", False):
@@ -529,7 +581,10 @@ def main() -> None:
         help="Worker URL (can be repeated)",
     )
     parser.add_argument("--db-path", type=str, default=None)
-    parser.add_argument("--store", type=str, default=None, choices=["sqlite", "memory"])
+    parser.add_argument("--store", type=str, default=None, choices=["sqlite", "memory", "s3"])
+    parser.add_argument("--s3-bucket", type=str, default=None)
+    parser.add_argument("--s3-prefix", type=str, default=None)
+    parser.add_argument("--s3-region", type=str, default=None)
     parser.add_argument("--log-level", type=str, default=None)
     parser.add_argument(
         "--model",

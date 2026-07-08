@@ -29,6 +29,9 @@ class TraceRecord(BaseModel):
     metadata: dict[str, Any] = Field(default_factory=dict)
     raw_request: dict[str, Any] | None = None
     raw_response: dict[str, Any] | None = None
+    s3_bucket: str | None = None
+    s3_prefix: str | None = None
+    s3_region: str | None = None
 
 
 def _split_worker_url(raw: str) -> dict[str, str]:

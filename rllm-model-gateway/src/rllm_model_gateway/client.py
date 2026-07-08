@@ -104,6 +104,26 @@ class GatewayClient:
         resp.raise_for_status()
         return TraceRecord(**resp.json())
 
+    # -- Reward ------------------------------------------------------------
+
+    def post_reward(
+        self,
+        session_id: str,
+        value: float,
+        trace_id: str | None = None,
+        metadata: dict[str, Any] | None = None,
+    ) -> str:
+        body: dict[str, Any] = {"value": value}
+        if trace_id:
+            body["trace_id"] = trace_id
+        if metadata:
+            body["metadata"] = metadata
+        resp = self._http.post(
+            f"{self.gateway_url}/sessions/{session_id}/reward", json=body
+        )
+        resp.raise_for_status()
+        return resp.json()["reward_id"]
+
     # -- Worker management -------------------------------------------------
 
     def add_worker(
@@ -251,6 +271,26 @@ class AsyncGatewayClient:
         resp = await self._http.get(f"{self.gateway_url}/traces/{trace_id}")
         resp.raise_for_status()
         return TraceRecord(**resp.json())
+
+    # -- Reward ------------------------------------------------------------
+
+    async def post_reward(
+        self,
+        session_id: str,
+        value: float,
+        trace_id: str | None = None,
+        metadata: dict[str, Any] | None = None,
+    ) -> str:
+        body: dict[str, Any] = {"value": value}
+        if trace_id:
+            body["trace_id"] = trace_id
+        if metadata:
+            body["metadata"] = metadata
+        resp = await self._http.post(
+            f"{self.gateway_url}/sessions/{session_id}/reward", json=body
+        )
+        resp.raise_for_status()
+        return resp.json()["reward_id"]
 
     # -- Worker management -------------------------------------------------
 
