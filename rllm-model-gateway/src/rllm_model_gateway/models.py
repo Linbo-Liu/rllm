@@ -29,9 +29,6 @@ class TraceRecord(BaseModel):
     metadata: dict[str, Any] = Field(default_factory=dict)
     raw_request: dict[str, Any] | None = None
     raw_response: dict[str, Any] | None = None
-    s3_bucket: str | None = None
-    s3_prefix: str | None = None
-    s3_region: str | None = None
 
 
 def _split_worker_url(raw: str) -> dict[str, str]:
@@ -117,6 +114,11 @@ class GatewayConfig(BaseModel):
     workers: list[WorkerConfig] = Field(default_factory=list)
     db_path: str | None = None
     store_worker: str = "memory"
+    # S3 trace store settings, used when store_worker="s3". Each may also be
+    # supplied via env (RLLM_GATEWAY_S3_BUCKET / _PREFIX / _REGION).
+    s3_bucket: str | None = None
+    s3_prefix: str | None = None
+    s3_region: str | None = None
     add_logprobs: bool = True
     add_return_token_ids: bool = True
     strip_vllm_fields: bool = True
@@ -129,3 +131,16 @@ class GatewayConfig(BaseModel):
     # renderers family for the cumulative-mode bridge. Check supported model families
     # in MODEL_RENDERER_MAP of https://github.com/PrimeIntellect-ai/renderers/blob/main/renderers/base.py
     renderer_family: str = "auto"
+    # use_sglang: route generation through SGLang's native /generate API instead
+    # of the OpenAI /v1/{chat/,}completions endpoints. /generate returns token ids
+    # + logprobs in meta_info natively (no server-side schema patch needed) and
+    # accepts pre-tokenized input_ids through sgl-router — so it is the correct
+    # transport for capturing token ids on any SGLang server or sgl-router endpoint.
+    use_sglang: bool = False
+    # SGLang function-call parser name (e.g. "qwen", "llama3", "deepseekv3") used
+    # to parse tool calls out of /generate output text in use_sglang mode.
+    # Required for tool-using agents in use_sglang mode.
+    sglang_tool_call_parser: str | None = None
+    # SGLang reasoning parser name (e.g. "qwen3", "deepseek-r1") to split
+    # <think>…</think> reasoning from output text.
+    sglang_reasoning_parser: str | None = None
