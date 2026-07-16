@@ -81,6 +81,17 @@ class GatewayClient:
         resp.raise_for_status()
         return resp.json().get("deleted", 0)
 
+    def mark_consumed(self, session_id: str) -> int:
+        """Move a session out of the live list_sessions listing after consuming it.
+
+        Keeps list_sessions cost O(unconsumed). Trace payloads are preserved
+        (S3 store relocates markers to a consumed/ prefix; other backends drop
+        the session). Returns the number of objects/rows affected.
+        """
+        resp = self._http.post(f"{self.gateway_url}/sessions/{session_id}/consume")
+        resp.raise_for_status()
+        return resp.json().get("consumed", 0)
+
     # -- Trace retrieval ---------------------------------------------------
 
     def get_session_traces(
@@ -248,6 +259,12 @@ class AsyncGatewayClient:
         )
         resp.raise_for_status()
         return resp.json().get("deleted", 0)
+
+    async def mark_consumed(self, session_id: str) -> int:
+        """Move a session out of the live list_sessions listing after consuming it."""
+        resp = await self._http.post(f"{self.gateway_url}/sessions/{session_id}/consume")
+        resp.raise_for_status()
+        return resp.json().get("consumed", 0)
 
     # -- Trace retrieval ---------------------------------------------------
 

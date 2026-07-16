@@ -126,6 +126,18 @@ class ReverseProxy:
         self._http: httpx.AsyncClient | None = None
         self._pending_traces: set[asyncio.Task[None]] = set()
         self._accumulators: dict[str, TokenAccumulator] = {}
+        # Sessions flagged ephemeral (e.g. eval): served normally, but their
+        # traces + reward are NOT persisted to the store, so a reader's
+        # list_sessions never sees them and they can't be picked up for
+        # training. Populated from create_session metadata {"eval": true}.
+        self._ephemeral_sessions: set[str] = set()
+
+    def mark_ephemeral(self, session_id: str) -> None:
+        """Flag a session so its traces/reward are never persisted."""
+        self._ephemeral_sessions.add(session_id)
+
+    def is_ephemeral(self, session_id: str) -> bool:
+        return session_id in self._ephemeral_sessions
 
     def _get_accumulator(self, session_id: str) -> TokenAccumulator:
         """Return the TokenAccumulator for *session_id*, creating if needed."""
@@ -1055,6 +1067,11 @@ class ReverseProxy:
         raise last_exc  # type: ignore[misc]
 
     async def _persist(self, trace: TraceRecord) -> None:
+        # Ephemeral (eval) sessions are served but never written to the store,
+        # so a reader's list_sessions never sees them (no train/eval leakage,
+        # no store bloat).
+        if self.is_ephemeral(trace.session_id):
+            return
         try:
             data = trace.model_dump()
             if self.sync_traces:
@@ -1067,6 +1084,10 @@ class ReverseProxy:
             logger.exception("Failed to persist trace %s", trace.trace_id)
 
     async def _safe_store(self, trace_id: str, session_id: str, data: dict[str, Any]) -> None:
+        # Also guard here: streaming paths call _safe_store directly (not via
+        # _persist), so ephemeral sessions must be filtered at this level too.
+        if self.is_ephemeral(session_id):
+            return
         try:
             await self.store.store_trace(trace_id, session_id, data)
         except Exception:

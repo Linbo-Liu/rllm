@@ -29,6 +29,12 @@ dev = [
     "litellm>=1.0",
 ]
 
+sglang = [
+    "transformers==5.8.1",
+    "numpy==1.26.4",
+    "renderers==0.1.7",
+]
+
 [project.scripts]
 rllm-model-gateway = "rllm_model_gateway.server:main"
 

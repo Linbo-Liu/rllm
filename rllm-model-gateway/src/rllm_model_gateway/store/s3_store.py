@@ -9,6 +9,12 @@ Object layout (under an optional key prefix)::
         Lightweight marker used for session-scoped listing. Sorting the
         listing lexicographically yields traces in insertion order.
 
+    consumed/sessions/{session_id}/...
+        Where a session's markers + reward are moved once a reader has
+        consumed it (see ``mark_consumed``). ``list_sessions`` scans only the
+        live ``sessions/`` prefix, so its cost stays O(unconsumed) instead of
+        O(all-sessions-ever) — the key to keeping polling scalable.
+
 Reads issue ``ListObjectsV2`` on the session prefix, then fetch the
 corresponding ``traces/{trace_id}.json`` objects. All boto3 calls are
 executed in a thread executor so the interface stays async-compatible.
@@ -64,6 +70,9 @@ class S3TraceStore:
 
     def _session_prefix(self, session_id: str) -> str:
         return f"{self.prefix}sessions/{session_id}/"
+
+    def _consumed_session_prefix(self, session_id: str) -> str:
+        return f"{self.prefix}consumed/sessions/{session_id}/"
 
     async def store_trace(self, trace_id: str, session_id: str, data: dict[str, Any]) -> None:
         now = time.time()
@@ -218,6 +227,39 @@ class S3TraceStore:
                 Bucket=self.bucket,
                 Delete={"Objects": [{"Key": k} for k in chunk], "Quiet": True},
             )
+
+    async def mark_consumed(self, session_id: str) -> int:
+        """Move a session's marker + reward objects out of the live listing.
+
+        Relocates every object under ``sessions/{sid}/`` to
+        ``consumed/sessions/{sid}/`` (copy + delete). Trace payloads under
+        ``traces/`` are left in place — ``list_sessions`` never scans them,
+        so moving only the small marker/reward objects is enough to shrink
+        the scan while preserving full history for later inspection.
+
+        Idempotent: a session already moved (no live objects) is a no-op.
+        Returns the number of objects relocated.
+        """
+        return await asyncio.to_thread(self._mark_consumed_sync, session_id)
+
+    def _mark_consumed_sync(self, session_id: str) -> int:
+        src_prefix = self._session_prefix(session_id)
+        dst_prefix = self._consumed_session_prefix(session_id)
+        paginator = self._client.get_paginator("list_objects_v2")
+        moved_keys: list[str] = []
+        for page in paginator.paginate(Bucket=self.bucket, Prefix=src_prefix):
+            for obj in page.get("Contents", []) or []:
+                key = obj["Key"]
+                dst_key = dst_prefix + key[len(src_prefix):]
+                self._client.copy_object(
+                    Bucket=self.bucket,
+                    CopySource={"Bucket": self.bucket, "Key": key},
+                    Key=dst_key,
+                )
+                moved_keys.append(key)
+        # Delete originals only after all copies succeeded (best-effort atomicity).
+        self._batch_delete(moved_keys)
+        return len(moved_keys)
 
     async def list_sessions(
         self,

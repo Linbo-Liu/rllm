@@ -198,6 +198,11 @@ class SqliteTraceStore:
         await conn.commit()
         return len(unique_ids)
 
+    async def mark_consumed(self, session_id: str) -> int:
+        # SQLite listing is already indexed/cheap; dropping the session is the
+        # simplest way to remove it from the live listing (matches S3 semantics).
+        return await self.delete_session(session_id)
+
     async def list_sessions(
         self,
         since: float | None = None,

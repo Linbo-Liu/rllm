@@ -88,3 +88,14 @@ class SessionManager:
         self._created_at.pop(session_id, None)
         self._sampling_params.pop(session_id, None)
         return await self.store.delete_session(session_id)
+
+    async def mark_consumed(self, session_id: str) -> int:
+        """Move a consumed session out of the live listing (see store.mark_consumed).
+
+        Also drops the in-memory session bookkeeping so a consumed session
+        stops appearing in ``list_sessions``.
+        """
+        self._metadata.pop(session_id, None)
+        self._created_at.pop(session_id, None)
+        self._sampling_params.pop(session_id, None)
+        return await self.store.mark_consumed(session_id)

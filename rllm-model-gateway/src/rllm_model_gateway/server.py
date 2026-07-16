@@ -283,11 +283,16 @@ def create_app(
     @app.post("/sessions")
     async def create_session(request: Request):
         body = await _safe_json(request)
+        metadata = body.get("metadata")
         sid = sessions.create_session(
             session_id=body.get("session_id"),
-            metadata=body.get("metadata"),
+            metadata=metadata,
             sampling_params=body.get("sampling_params"),
         )
+        # metadata={"eval": true} → serve normally but never persist this
+        # session's traces/reward (so a training reader never sees it).
+        if metadata and metadata.get("eval"):
+            proxy.mark_ephemeral(sid)
         return {"session_id": sid, "url": f"/sessions/{sid}/v1"}
 
     @app.get("/sessions")
@@ -343,9 +348,26 @@ def create_app(
         count = await sessions.delete_session(session_id)
         return {"deleted": count}
 
+    @app.post("/sessions/{session_id:path}/consume")
+    async def mark_consumed(session_id: str):
+        """Move a consumed session out of the live listing so list_sessions
+        stays O(unconsumed). Called by the trainer after it picks a session
+        into a training batch."""
+        proxy._accumulators.pop(session_id, None)
+        count = await sessions.mark_consumed(session_id)
+        return {"consumed": count}
+
     @app.post("/sessions/{session_id}/reward")
     async def post_reward(session_id: str, request: Request):
         body = await _safe_json(request)
+        # A reward can also carry the eval flag (belt-and-suspenders: even if
+        # the session wasn't created with metadata={"eval":true}, an eval
+        # reward marks it ephemeral so it's never persisted).
+        if (body.get("metadata") or {}).get("eval"):
+            proxy.mark_ephemeral(session_id)
+        # Ephemeral (eval) sessions: acknowledge but don't persist the reward.
+        if proxy.is_ephemeral(session_id):
+            return {"reward_id": f"reward-{session_id}", "persisted": False}
         reward_id = f"reward-{session_id}"
         payload = {
             "trace_id": reward_id,
@@ -358,7 +380,7 @@ def create_app(
         }
         sessions.ensure_session(session_id)
         await store.store_trace(reward_id, session_id, payload)
-        return {"reward_id": reward_id}
+        return {"reward_id": reward_id, "persisted": True}
 
     @app.post("/sessions/batch_delete")
     async def batch_delete_sessions(request: Request):
