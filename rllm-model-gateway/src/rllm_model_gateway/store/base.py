@@ -32,6 +32,15 @@ class TraceStore(Protocol):
         """Delete all traces for a session.  Returns count deleted."""
         ...
 
+    async def mark_consumed(self, session_id: str) -> int:
+        """Move a session out of the live ``list_sessions`` listing after a
+        reader has consumed it, so listing cost stays O(unconsumed).
+
+        Backends without a cheap partitioning primitive may fall back to
+        ``delete_session``. Returns the number of objects/rows affected.
+        """
+        ...
+
     async def list_sessions(
         self,
         since: float | None = None,

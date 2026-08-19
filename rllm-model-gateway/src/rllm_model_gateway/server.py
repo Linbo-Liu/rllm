@@ -4,6 +4,7 @@ import argparse
 import asyncio
 import logging
 import os
+import time
 import uuid
 from collections.abc import Awaitable, Callable
 from contextlib import asynccontextmanager
@@ -87,6 +88,19 @@ def create_store(config: GatewayConfig) -> TraceStore:
         from rllm_model_gateway.store.memory_store import MemoryTraceStore
 
         return MemoryTraceStore()
+    elif worker == "s3":
+        from rllm_model_gateway.store.s3_store import S3TraceStore
+
+        bucket = config.s3_bucket or os.environ.get("RLLM_GATEWAY_S3_BUCKET")
+        if not bucket:
+            raise ValueError(
+                "store_worker='s3' requires config.s3_bucket or RLLM_GATEWAY_S3_BUCKET"
+            )
+        return S3TraceStore(
+            bucket=bucket,
+            prefix=config.s3_prefix or os.environ.get("RLLM_GATEWAY_S3_PREFIX", ""),
+            region_name=config.s3_region or os.environ.get("AWS_REGION"),
+        )
     else:
         raise ValueError(f"Unknown store worker: {worker}")
 
@@ -154,16 +168,26 @@ def create_app(
     # served model path (``config.model``), which we assume is a complete,
     # unmodified HuggingFace checkpoint.
     renderer = None
-    if config.cumulative_token_mode:
+    tokenizer = None
+    # use_sglang needs the model tokenizer (to decode /generate completion token
+    # ids for tool-call parsing). cumulative_token_mode additionally needs the
+    # renderer (the cross-turn bridge that keeps prior sampled tokens verbatim).
+    # Non-cumulative use_sglang does NOT need the renderer: input tokenization is
+    # done server-side via /tokenize and output parsing via SGLang's parser.
+    if config.cumulative_token_mode or config.use_sglang:
         if not config.model:
-            raise ValueError("cumulative_token_mode=True requires 'model' to be set in GatewayConfig (path to the served HuggingFace checkpoint).")
+            raise ValueError("cumulative_token_mode/use_sglang require 'model' to be set in GatewayConfig (path to the served HuggingFace checkpoint).")
         try:
-            from renderers import create_renderer
             from transformers import AutoTokenizer
         except ImportError as err:
-            raise ImportError("cumulative_token_mode requires the 'renderers' and 'transformers' packages. Install them with: pip install renderers transformers") from err
-
+            raise ImportError("cumulative_token_mode/use_sglang require the 'transformers' package. Install it with: pip install transformers") from err
         tokenizer = AutoTokenizer.from_pretrained(config.model)
+
+    if config.cumulative_token_mode:
+        try:
+            from renderers import create_renderer
+        except ImportError as err:
+            raise ImportError("cumulative_token_mode requires the 'renderers' package. Install it with: pip install renderers") from err
 
         # renderer_family="auto" lets renderers resolve the family by matching the
         # tokenizer's name_or_path against its MODEL_RENDERER_MAP. This succeeds
@@ -175,10 +199,12 @@ def create_app(
         #   https://github.com/PrimeIntellect-ai/renderers/blob/main/renderers/base.py
         renderer = create_renderer(tokenizer, renderer=config.renderer_family)
         logger.info(
-            "Built %s (family=%r) from %s for cumulative token mode",
+            "Built %s (family=%r) from %s for cumulative_token_mode=%s use_sglang=%s",
             type(renderer).__name__,
             config.renderer_family,
             config.model,
+            config.cumulative_token_mode,
+            config.use_sglang,
         )
         if type(renderer).__name__ == "DefaultRenderer":
             raise ValueError(
@@ -201,7 +227,12 @@ def create_app(
         sync_traces=config.sync_traces,
         local_handler=local_handler,
         cumulative_token_mode=config.cumulative_token_mode,
+        use_sglang=config.use_sglang,
         renderer=renderer,
+        tokenizer=tokenizer,
+        model=config.model,
+        sglang_tool_call_parser=config.sglang_tool_call_parser,
+        sglang_reasoning_parser=config.sglang_reasoning_parser,
     )
     sessions = SessionManager(store)
 
@@ -252,11 +283,16 @@ def create_app(
     @app.post("/sessions")
     async def create_session(request: Request):
         body = await _safe_json(request)
+        metadata = body.get("metadata")
         sid = sessions.create_session(
             session_id=body.get("session_id"),
-            metadata=body.get("metadata"),
+            metadata=metadata,
             sampling_params=body.get("sampling_params"),
         )
+        # metadata={"eval": true} → serve normally but never persist this
+        # session's traces/reward (so a training reader never sees it).
+        if metadata and metadata.get("eval"):
+            proxy.mark_ephemeral(sid)
         return {"session_id": sid, "url": f"/sessions/{sid}/v1"}
 
     @app.get("/sessions")
@@ -281,7 +317,19 @@ def create_app(
         since: float | None = Query(None),
         limit: int | None = Query(None),
     ):
-        traces = await store.get_session_traces(session_id, since=since, limit=limit)
+        records = await store.get_session_traces(session_id, since=since, limit=limit)
+        reward = next(
+            (r for r in records if r.get("kind") == "reward"),
+            None,
+        )
+        traces = [r for r in records if r.get("kind") != "reward"]
+        if reward is not None:
+            for t in traces:
+                meta = t.setdefault("metadata", {}) or {}
+                meta["reward"] = reward.get("value")
+                if reward.get("metadata"):
+                    meta["reward_metadata"] = reward["metadata"]
+                t["metadata"] = meta
         return traces
 
     @app.get("/sessions/{session_id:path}")
@@ -299,6 +347,40 @@ def create_app(
         proxy._accumulators.pop(session_id, None)
         count = await sessions.delete_session(session_id)
         return {"deleted": count}
+
+    @app.post("/sessions/{session_id:path}/consume")
+    async def mark_consumed(session_id: str):
+        """Move a consumed session out of the live listing so list_sessions
+        stays O(unconsumed). Called by the trainer after it picks a session
+        into a training batch."""
+        proxy._accumulators.pop(session_id, None)
+        count = await sessions.mark_consumed(session_id)
+        return {"consumed": count}
+
+    @app.post("/sessions/{session_id}/reward")
+    async def post_reward(session_id: str, request: Request):
+        body = await _safe_json(request)
+        # A reward can also carry the eval flag (belt-and-suspenders: even if
+        # the session wasn't created with metadata={"eval":true}, an eval
+        # reward marks it ephemeral so it's never persisted).
+        if (body.get("metadata") or {}).get("eval"):
+            proxy.mark_ephemeral(session_id)
+        # Ephemeral (eval) sessions: acknowledge but don't persist the reward.
+        if proxy.is_ephemeral(session_id):
+            return {"reward_id": f"reward-{session_id}", "persisted": False}
+        reward_id = f"reward-{session_id}"
+        payload = {
+            "trace_id": reward_id,
+            "session_id": session_id,
+            "kind": "reward",
+            "value": body.get("value"),
+            "trace_ref": body.get("trace_id"),
+            "metadata": body.get("metadata", {}),
+            "timestamp": time.time(),
+        }
+        sessions.ensure_session(session_id)
+        await store.store_trace(reward_id, session_id, payload)
+        return {"reward_id": reward_id, "persisted": True}
 
     @app.post("/sessions/batch_delete")
     async def batch_delete_sessions(request: Request):
@@ -477,6 +559,9 @@ def _load_config(args: argparse.Namespace) -> GatewayConfig:
         "RLLM_GATEWAY_DB_PATH": "db_path",
         "RLLM_GATEWAY_LOG_LEVEL": "log_level",
         "RLLM_GATEWAY_STORE": "store_worker",
+        "RLLM_GATEWAY_S3_BUCKET": "s3_bucket",
+        "RLLM_GATEWAY_S3_PREFIX": "s3_prefix",
+        "RLLM_GATEWAY_S3_REGION": "s3_region",
     }
     for env_key, config_key in env_map.items():
         val = os.environ.get(env_key)
@@ -497,12 +582,24 @@ def _load_config(args: argparse.Namespace) -> GatewayConfig:
         data["log_level"] = args.log_level
     if getattr(args, "store", None) is not None:
         data["store_worker"] = args.store
+    if getattr(args, "s3_bucket", None) is not None:
+        data["s3_bucket"] = args.s3_bucket
+    if getattr(args, "s3_prefix", None) is not None:
+        data["s3_prefix"] = args.s3_prefix
+    if getattr(args, "s3_region", None) is not None:
+        data["s3_region"] = args.s3_region
     if getattr(args, "model", None) is not None:
         data["model"] = args.model
     if getattr(args, "cumulative_token_mode", False):
         data["cumulative_token_mode"] = True
+    if getattr(args, "use_sglang", False):
+        data["use_sglang"] = True
     if getattr(args, "renderer_family", None) is not None:
         data["renderer_family"] = args.renderer_family
+    if getattr(args, "sglang_tool_call_parser", None) is not None:
+        data["sglang_tool_call_parser"] = args.sglang_tool_call_parser
+    if getattr(args, "sglang_reasoning_parser", None) is not None:
+        data["sglang_reasoning_parser"] = args.sglang_reasoning_parser
 
     # Workers from CLI --worker flags (WorkerConfig validator auto-splits URLs)
     worker_urls = getattr(args, "worker", None) or []
@@ -529,7 +626,10 @@ def main() -> None:
         help="Worker URL (can be repeated)",
     )
     parser.add_argument("--db-path", type=str, default=None)
-    parser.add_argument("--store", type=str, default=None, choices=["sqlite", "memory"])
+    parser.add_argument("--store", type=str, default=None, choices=["sqlite", "memory", "s3"])
+    parser.add_argument("--s3-bucket", type=str, default=None)
+    parser.add_argument("--s3-prefix", type=str, default=None)
+    parser.add_argument("--s3-region", type=str, default=None)
     parser.add_argument("--log-level", type=str, default=None)
     parser.add_argument(
         "--model",
@@ -542,6 +642,30 @@ def main() -> None:
         action="store_true",
         default=False,
         help="Enable cumulative token mode for drift-free multi-turn RL training. Loads the tokenizer from --model (the served HuggingFace checkpoint).",
+    )
+    parser.add_argument(
+        "--use-sglang",
+        action="store_true",
+        default=False,
+        help="Route generation through SGLang's native /generate API (token ids + "
+        "logprobs in meta_info, works through sgl-router) instead of the OpenAI "
+        "/v1/{chat/,}completions endpoints. Requires --model and a renderer; the "
+        "gateway renders each turn's prompt to token ids itself. Required for RL "
+        "with SGLang server or sgl-router as inference endpoint.",
+    )
+    parser.add_argument(
+        "--sglang-tool-call-parser",
+        type=str,
+        default=None,
+        help="SGLang function-call parser name (e.g. 'qwen', 'llama3', 'deepseekv3') used "
+        "in use_sglang mode to parse tool calls from /generate output text, required for"
+        "tool-using agents in use_sglang mode.",
+    )
+    parser.add_argument(
+        "--sglang-reasoning-parser",
+        type=str,
+        default=None,
+        help="SGLang reasoning parser name (e.g. 'qwen3', 'deepseek-r1') to split <think>...</think> reasoning from output text in use_sglang mode. Optional.",
     )
     parser.add_argument(
         "--renderer-family",

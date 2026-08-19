@@ -81,6 +81,17 @@ class GatewayClient:
         resp.raise_for_status()
         return resp.json().get("deleted", 0)
 
+    def mark_consumed(self, session_id: str) -> int:
+        """Move a session out of the live list_sessions listing after consuming it.
+
+        Keeps list_sessions cost O(unconsumed). Trace payloads are preserved
+        (S3 store relocates markers to a consumed/ prefix; other backends drop
+        the session). Returns the number of objects/rows affected.
+        """
+        resp = self._http.post(f"{self.gateway_url}/sessions/{session_id}/consume")
+        resp.raise_for_status()
+        return resp.json().get("consumed", 0)
+
     # -- Trace retrieval ---------------------------------------------------
 
     def get_session_traces(
@@ -103,6 +114,26 @@ class GatewayClient:
         resp = self._http.get(f"{self.gateway_url}/traces/{trace_id}")
         resp.raise_for_status()
         return TraceRecord(**resp.json())
+
+    # -- Reward ------------------------------------------------------------
+
+    def post_reward(
+        self,
+        session_id: str,
+        value: float,
+        trace_id: str | None = None,
+        metadata: dict[str, Any] | None = None,
+    ) -> str:
+        body: dict[str, Any] = {"value": value}
+        if trace_id:
+            body["trace_id"] = trace_id
+        if metadata:
+            body["metadata"] = metadata
+        resp = self._http.post(
+            f"{self.gateway_url}/sessions/{session_id}/reward", json=body
+        )
+        resp.raise_for_status()
+        return resp.json()["reward_id"]
 
     # -- Worker management -------------------------------------------------
 
@@ -229,6 +260,12 @@ class AsyncGatewayClient:
         resp.raise_for_status()
         return resp.json().get("deleted", 0)
 
+    async def mark_consumed(self, session_id: str) -> int:
+        """Move a session out of the live list_sessions listing after consuming it."""
+        resp = await self._http.post(f"{self.gateway_url}/sessions/{session_id}/consume")
+        resp.raise_for_status()
+        return resp.json().get("consumed", 0)
+
     # -- Trace retrieval ---------------------------------------------------
 
     async def get_session_traces(
@@ -251,6 +288,26 @@ class AsyncGatewayClient:
         resp = await self._http.get(f"{self.gateway_url}/traces/{trace_id}")
         resp.raise_for_status()
         return TraceRecord(**resp.json())
+
+    # -- Reward ------------------------------------------------------------
+
+    async def post_reward(
+        self,
+        session_id: str,
+        value: float,
+        trace_id: str | None = None,
+        metadata: dict[str, Any] | None = None,
+    ) -> str:
+        body: dict[str, Any] = {"value": value}
+        if trace_id:
+            body["trace_id"] = trace_id
+        if metadata:
+            body["metadata"] = metadata
+        resp = await self._http.post(
+            f"{self.gateway_url}/sessions/{session_id}/reward", json=body
+        )
+        resp.raise_for_status()
+        return resp.json()["reward_id"]
 
     # -- Worker management -------------------------------------------------
 

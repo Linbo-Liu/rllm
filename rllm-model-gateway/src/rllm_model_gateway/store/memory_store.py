@@ -61,6 +61,11 @@ class MemoryTraceStore:
                 deleted += 1
         return deleted
 
+    async def mark_consumed(self, session_id: str) -> int:
+        # No cheap partition for the in-memory store; drop the session so it
+        # leaves the live listing (same net effect as the S3 consumed prefix).
+        return await self.delete_session(session_id)
+
     async def list_sessions(
         self,
         since: float | None = None,
